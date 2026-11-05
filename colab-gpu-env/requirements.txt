@@ -1,0 +1,10 @@
+# T4 / CUDA 12.x runtime, Python 3.11-3.13.
+# llama-cpp-python MUST come from the CUDA wheel index (prebuilt, py3-none);
+# a plain `pip install` compiles with nvcc and takes ~20min on 2 vCPU.
+#   python3 -m pip install --only-binary=:all: llama-cpp-python==0.3.36 \
+#       --extra-index-url https://abetlen.github.io/llama-cpp-python/whl/cu124
+
+llama-cpp-python==0.3.36
+huggingface_hub[hf_transfer]>=0.26.0
+openai>=1.50.0
+google-colab-cli>=0.7.5
