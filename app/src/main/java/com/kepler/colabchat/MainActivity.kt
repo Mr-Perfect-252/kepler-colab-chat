@@ -109,7 +109,10 @@ fun ChatScreen(vm: ChatViewModel = viewModel()) {
             ) {
                 items(messages) { m ->
                     val isUser = m.role == "user"
-                    Row(Modifier.fillMaxWidth()) {
+                    Row(
+                        Modifier.fillMaxWidth(),
+                        horizontalArrangement = if (isUser) Arrangement.End else Arrangement.Start,
+                    ) {
                         Box(
                             Modifier
                                 .fillMaxWidth(if (isUser) 0.85f else 1f)
@@ -117,8 +120,7 @@ fun ChatScreen(vm: ChatViewModel = viewModel()) {
                                     if (isUser) Color(0xFF1B2431) else Color.Transparent,
                                     RoundedCornerShape(12.dp),
                                 )
-                                .padding(10.dp)
-                                .then(if (isUser) Modifier.align(Alignment.CenterEnd) else Modifier),
+                                .padding(10.dp),
                         ) {
                             Column {
                                 Text(

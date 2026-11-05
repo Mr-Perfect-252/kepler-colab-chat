@@ -101,7 +101,7 @@ class ChatViewModel(
         private fun defaultSource(): EndpointSource = FallbackEndpointSource(
             primary = RemoteEndpointSource(
                 url = BuildConfig.RENDEZVOUS_URL,
-                token = BuildConfig.RENDEZVOUS_TOKEN.ifBlank { null },
+                token = null,   // the published endpoint.json is unauthenticated
             ),
             fallback = StaticEndpointSource(
                 Endpoint(
