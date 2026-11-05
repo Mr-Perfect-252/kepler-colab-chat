@@ -20,7 +20,13 @@ jobs:
           distribution: temurin
           java-version: "17"
 
-      - uses: android-actions/setup-android@v3
+      # ubuntu-latest already ships the Android SDK (platform 34 + build-tools),
+      # and android-actions/setup-android@v3 fails on `sdkmanager --install tools`
+      # because that package was removed from the repository.
+      - name: Show SDK
+        run: |
+          echo "ANDROID_HOME=$ANDROID_HOME"
+          ls "$ANDROID_HOME/platforms" 2>/dev/null | tail -3
 
       - uses: gradle/actions/setup-gradle@v3
         with:
