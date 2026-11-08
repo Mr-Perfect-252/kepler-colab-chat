@@ -10,7 +10,6 @@ import com.kepler.colabchat.data.Endpoint
 import com.kepler.colabchat.data.EndpointSource
 import com.kepler.colabchat.data.FallbackEndpointSource
 import com.kepler.colabchat.data.RemoteEndpointSource
-import com.kepler.colabchat.data.Reviver
 import com.kepler.colabchat.data.StaticEndpointSource
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -47,18 +46,11 @@ class ChatViewModel(
         }
     }
 
-    /** Ask Actions to boot a runtime, then keep retrying until it answers. */
+    /** Fire the revive workflow and poll until it publishes a live endpoint. */
     fun reviveAndReconnect() {
+        if (manager.isReviving) return
         viewModelScope.launch {
-            val started = withContext(Dispatchers.IO) { manager.revive() }
-            if (!started) return@launch
-            // A T4 takes ~3-5 min: model download + load. Poll patiently.
-            repeat(24) {
-                kotlinx.coroutines.delay(15_000)
-                if (withContext(Dispatchers.IO) { manager.connect(forceRediscovery = true) } != null) {
-                    return@launch
-                }
-            }
+            withContext(Dispatchers.IO) { manager.reviveAndWait(maxMinutes = 15) }
         }
     }
 

@@ -7,23 +7,29 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.withContext
 import java.io.IOException
+import java.net.UnknownHostException
 
 sealed interface ConnState {
     data object Idle : ConnState
     data class Connecting(val attempt: Int, val note: String) : ConnState
     data class Ready(val endpoint: Endpoint, val latencyMs: Long) : ConnState
-    data class Dead(val reason: String, val revivalRequested: Boolean = false) : ConnState
+    data class Dead(val reason: String) : ConnState
+    /** A revival workflow is running; the app is polling for the new endpoint. */
+    data class Reviving(val elapsedSec: Int, val note: String) : ConnState
 }
 
 /**
  * Owns the connection lifecycle:
  *
  *   1. ping the cached endpoint
- *   2. on 401 (key rotated) or transport error, re-read the rendezvous and ping again
- *   3. back off and repeat, then surface [ConnState.Dead] with the real reason
+ *   2. on 401 (key rotated) or unknown host (tunnel gone), re-read the rendezvous
+ *   3. if that also fails, ask Actions to boot a fresh runtime and poll for the
+ *      endpoint it publishes
  *
- * It cannot mint credentials — rotation happens on the VM when `serve.sh` boots.
- * What it *can* do is notice the rotation and reconnect without user involvement.
+ * The previous version gave up after ~6 min AND overwrote the reviving state on
+ * every failed poll, so the UI snapped back to a plain `dead` while a runtime was
+ * still booting — it looked inert even though revival was working. Revival now owns
+ * the state for its whole duration.
  */
 class ConnectionManager(
     private val source: EndpointSource,
@@ -38,20 +44,26 @@ class ConnectionManager(
     var endpoint: Endpoint? = null
         private set
 
-    /** Non-blocking view for the UI badge. */
-    val isReady: Boolean get() = _state.value is ConnState.Ready
+    @Volatile
+    private var reviving = false
+
+    val isReviving: Boolean get() = reviving
 
     suspend fun connect(forceRediscovery: Boolean = false): Endpoint? {
         if (forceRediscovery) endpoint = null
         var lastError = "no endpoint"
 
         for (attempt in 1..maxAttempts) {
-            val note = when {
-                attempt == 1 && endpoint == null -> "discovering endpoint"
-                attempt == 1 -> "pinging runtime"
-                else -> "re-discovering after failure"
+            if (!reviving) {
+                _state.value = ConnState.Connecting(
+                    attempt,
+                    when {
+                        attempt == 1 && endpoint == null -> "discovering endpoint"
+                        attempt == 1 -> "pinging runtime"
+                        else -> "re-discovering after failure"
+                    },
+                )
             }
-            _state.value = ConnState.Connecting(attempt, note)
 
             val candidate = endpoint ?: runCatching { source.fetch() }
                 .onFailure { lastError = "rendezvous: ${it.message ?: "unreachable"}" }
@@ -61,15 +73,12 @@ class ConnectionManager(
                 runCatching { client.ping(candidate) }
                     .onSuccess { latency ->
                         endpoint = candidate
+                        reviving = false
                         _state.value = ConnState.Ready(candidate, latency)
                         return candidate
                     }
                     .onFailure { e ->
-                        lastError = when (e) {
-                            is UnauthorizedException -> "key rotated — fetching new credentials"
-                            else -> e.message ?: "unreachable"
-                        }
-                        // Drop the stale creds so the next round fetches fresh ones.
+                        lastError = describe(e)
                         endpoint = null
                     }
             }
@@ -77,30 +86,58 @@ class ConnectionManager(
             if (attempt < maxAttempts) delay(backoffMillis(attempt))
         }
 
-        _state.value = ConnState.Dead(lastError)
+        if (!reviving) _state.value = ConnState.Dead(lastError)
         return null
     }
 
     /**
-     * Kick off a remote revival: ask Actions to boot a runtime and publish fresh
-     * credentials. The UI keeps polling after this returns, so the app reconnects
-     * on its own once the workflow has written the new endpoint.
+     * Dispatch the revive workflow and poll for up to [maxMinutes]. Each poll
+     * re-reads the rendezvous, so the app reconnects the moment Actions commits the
+     * new endpoint.
      */
-    suspend fun revive(): Boolean {
-        val reviver = reviver ?: return false
-        if (!reviver.isConfigured) return false
+    suspend fun reviveAndWait(maxMinutes: Int = 15): Boolean {
+        if (reviving) return false
+        val reviver = reviver
+        if (reviver == null || !reviver.isConfigured) {
+            _state.value = ConnState.Dead("revival not configured in this build")
+            return false
+        }
+
+        reviving = true
+        _state.value = ConnState.Reviving(0, "asking Actions to boot a T4")
+
         val accepted = withContext(Dispatchers.IO) { reviver.trigger() }
-        _state.value = ConnState.Dead(
-            reason = if (accepted) "runtime down — revival started" else "runtime down — revival failed",
-            revivalRequested = accepted,
-        )
-        return accepted
+        if (!accepted) {
+            reviving = false
+            _state.value = ConnState.Dead("revival rejected — check the PAT")
+            return false
+        }
+
+        val deadline = maxMinutes * 60
+        var waited = 0
+        while (waited < deadline) {
+            delay(20_000)
+            waited += 20
+            _state.value = ConnState.Reviving(waited, "Actions is provisioning a T4")
+
+            endpoint = null
+            val candidate = runCatching { source.fetch() }.getOrNull()
+            if (candidate != null) {
+                val latency = runCatching { client.ping(candidate) }.getOrNull()
+                if (latency != null) {
+                    endpoint = candidate
+                    reviving = false
+                    _state.value = ConnState.Ready(candidate, latency)
+                    return true
+                }
+            }
+        }
+
+        reviving = false
+        _state.value = ConnState.Dead("revival timed out after ${maxMinutes}m")
+        return false
     }
 
-    /**
-     * Send with one automatic recovery: a 401 mid-stream means the VM restarted
-     * between ping and send, so rediscover once and retry.
-     */
     suspend fun streamWithRecovery(
         messages: List<ChatMessage>,
         onDelta: (String) -> Unit,
@@ -115,6 +152,12 @@ class ConnectionManager(
         }
     }
 
+    private fun describe(e: Throwable): String = when (e) {
+        is UnauthorizedException -> "key rotated — fetching new credentials"
+        is UnknownHostException -> "tunnel gone (runtime reclaimed)"
+        else -> e.message ?: "unreachable"
+    }
+
     private fun backoffMillis(attempt: Int): Long =
-        (1_000L shl (attempt - 1)).coerceAtMost(8_000L)   // 1s, 2s, 4s, 8s
+        (1_000L shl (attempt - 1)).coerceAtMost(8_000L)
 }

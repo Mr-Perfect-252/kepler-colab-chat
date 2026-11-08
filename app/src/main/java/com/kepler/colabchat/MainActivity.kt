@@ -150,10 +150,9 @@ private fun StatusBar(state: ConnState, onRetry: () -> Unit, onRevive: () -> Uni
             "connected · ${state.latencyMs} ms · ${state.endpoint.model}"
         is ConnState.Connecting -> Color(0xFFF5A524) to
             "${state.note} (attempt ${state.attempt})"
-        is ConnState.Dead -> Color(0xFFFF6B6B) to when {
-            state.revivalRequested -> "reviving · Actions is provisioning a T4 (~3-5 min)"
-            else -> "dead · ${state.reason}"
-        }
+        is ConnState.Reviving -> Color(0xFFF5A524) to
+            "reviving ${state.elapsedSec / 60}m${state.elapsedSec % 60}s · ${state.note}"
+        is ConnState.Dead -> Color(0xFFFF6B6B) to "dead · ${state.reason}"
         ConnState.Idle -> Color(0xFF8B95A5) to "idle"
     }
 
@@ -169,7 +168,7 @@ private fun StatusBar(state: ConnState, onRetry: () -> Unit, onRevive: () -> Uni
             modifier = Modifier.padding(start = 8.dp).weight(1f),
             maxLines = 2,
         )
-        if (state is ConnState.Dead && !state.revivalRequested) {
+        if (state !is ConnState.Reviving && state !is ConnState.Ready) {
             TextButton(onClick = onRevive) { Text("revive", fontSize = 12.sp) }
         }
         TextButton(onClick = onRetry) { Text("retry", fontSize = 12.sp) }
