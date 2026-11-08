@@ -28,8 +28,7 @@ sealed interface ConnState {
  *
  * The previous version gave up after ~6 min AND overwrote the reviving state on
  * every failed poll, so the UI snapped back to a plain `dead` while a runtime was
- * still booting — it looked inert even though revival was working. Revival now owns
- * the state for its whole duration.
+ * still booting. Revival now owns the state for its whole duration.
  */
 class ConnectionManager(
     private val source: EndpointSource,
