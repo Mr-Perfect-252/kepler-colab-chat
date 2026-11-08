@@ -10,6 +10,7 @@ import com.kepler.colabchat.data.Endpoint
 import com.kepler.colabchat.data.EndpointSource
 import com.kepler.colabchat.data.FallbackEndpointSource
 import com.kepler.colabchat.data.RemoteEndpointSource
+import com.kepler.colabchat.data.Reviver
 import com.kepler.colabchat.data.StaticEndpointSource
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.MutableStateFlow
