@@ -1,19 +1,24 @@
 name: revive-colab
 
 # Triggered by the Android app (repository_dispatch: revive) or manually.
-# Boots a Colab T4, serves Mistral Small, publishes the endpoint so the app can
+# Boots a Colab T4, serves Mistral Small, publishes endpoint.json so the app can
 # reconnect on its own, then babysits the runtime until the job limit.
+#
+# Deliberately does NOT use `colab -s <name>`: aliases live in the local
+# ~/.config/colab-cli/sessions.json, and an alias created by `colab new` was not
+# resolvable by later steps, which left the poll loop spinning forever. With a
+# single active session the CLI resolves it automatically.
 on:
   repository_dispatch:
     types: [revive]
   workflow_dispatch:
 
 permissions:
-  contents: write   # to commit endpoint.json
+  contents: write
 
 concurrency:
   group: colab-revive
-  cancel-in-progress: false
+  cancel-in-progress: true
 
 jobs:
   revive:
@@ -40,80 +45,76 @@ jobs:
           chmod 600 ~/.config/colab-cli/token.json
           python colab-gpu-env/scripts/patch_scopes.py
           colab whoami
+          colab usage
 
       - name: Provision T4
-        run: colab new -s revive --gpu T4
+        run: |
+          colab new --gpu T4
+          colab sessions
 
-      - name: Upload environment bundle
+      - name: Upload bundle and start stack (one detached script)
         run: |
           tar czf /tmp/cge.tgz colab-gpu-env
-          colab upload -s revive /tmp/cge.tgz /content/cge.tgz
-
-      - name: Start setup (detached)
-        run: |
+          colab upload /tmp/cge.tgz /content/cge.tgz
           cat > /tmp/boot.py <<'PY'
           import subprocess
+          # setup then serve, sequentially, fully detached from the kernel request
           subprocess.Popen(
               "cd /content && tar xzf cge.tgz && chmod +x colab-gpu-env/*.sh && "
-              "nohup bash colab-gpu-env/setup.sh > /content/setup.log 2>&1 < /dev/null &",
+              "( bash colab-gpu-env/setup.sh && bash colab-gpu-env/serve.sh ) "
+              "> /content/boot.log 2>&1 < /dev/null &",
               shell=True)
-          print("setup started")
+          print("boot started")
           PY
-          colab exec -s revive -f /tmp/boot.py
+          colab exec -f /tmp/boot.py
 
-      - name: Wait for model stack
-        timeout-minutes: 25
+      - name: Wait for tunnel
+        timeout-minutes: 30
         run: |
-          for i in $(seq 1 120); do
-            colab exec -s revive -f colab-gpu-env/scripts/status.py 2>/dev/null \
-              | grep -E '^\{' | tail -1 > /tmp/status.json || true
-            if python3 -c "import json;print(json.load(open('/tmp/status.json'))['setup_done'])" 2>/dev/null | grep -q True; then
-              echo "setup complete after $((i*10))s"; exit 0
+          for i in $(seq 1 90); do
+            colab exec -f colab-gpu-env/scripts/status.py > /tmp/raw.txt 2>&1 || true
+            grep -E '^\{' /tmp/raw.txt | tail -1 > /tmp/status.json || true
+            URL=$(python3 -c "import json;print(json.load(open('/tmp/status.json'))['url'])" 2>/dev/null || echo "")
+            echo "[$i] url=${URL:-none}"
+            if [ -n "$URL" ]; then echo "tunnel up: $URL"; exit 0; fi
+            if python3 - <<'PY'
+import json,sys
+try:
+    d=json.load(open("/tmp/status.json"))
+    sys.exit(0 if (not d.get("setup_done") and not d.get("url")) else 1)
+except Exception:
+    sys.exit(1)
+PY
+            then
+              if grep -q "!!" /tmp/raw.txt; then echo "setup error"; cat /tmp/raw.txt; fi
             fi
-            echo "…waiting $((i*10))s"; sleep 10
+            sleep 20
           done
-          echo "setup did not finish in time" >&2
-          colab exec -s revive -f colab-gpu-env/scripts/status.py || true
-          exit 1
+          echo "no tunnel after 30 min; last probe:"; cat /tmp/raw.txt; exit 1
 
-      - name: Serve and publish endpoint
-        id: serve
+      - name: Publish endpoint
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          cat > /tmp/serve.py <<'PY'
-          import subprocess
-          subprocess.Popen("nohup bash /content/colab-gpu-env/serve.sh > /content/serve.log 2>&1 < /dev/null &", shell=True)
-          print("serve started")
-          PY
-          colab exec -s revive -f /tmp/serve.py
-
-          for i in $(seq 1 90); do
-            colab exec -s revive -f colab-gpu-env/scripts/status.py 2>/dev/null \
-              | grep -E '^\{' | tail -1 > /tmp/status.json || true
-            URL=$(python3 -c "import json;print(json.load(open('/tmp/status.json'))['url'])" 2>/dev/null || true)
-            [ -n "$URL" ] && break
-            echo "…waiting for tunnel ($i)"; sleep 5
-          done
-
-          python3 - "$URL" <<'PY'
-          import json, os, sys, time
+          python3 - <<'PY'
+          import json, time
           st = json.load(open("/tmp/status.json"))
+          assert st["url"], "no url"
           doc = {
-              "base_url": sys.argv[1],
+              "base_url": st["url"],
               "api_key": st["api_key"],
               "model": "mistral-small-3.1-24b",
               "updated_at": int(time.time()),
-              "session": f"actions-{os.environ.get('GITHUB_RUN_ID','local')}",
+              "session": "actions",
           }
-          open("/tmp/endpoint.json", "w").write(json.dumps(doc, indent=2))
-          print("endpoint:", sys.argv[1], "| gpu:", st.get("gpu"))
+          json.dump(doc, open("/tmp/endpoint.json", "w"), indent=2)
+          print("endpoint:", doc["base_url"], "| gpu:", st.get("gpu"))
           PY
 
           CONTENT=$(base64 -w0 /tmp/endpoint.json)
           SHA=$(curl -sS -H "Authorization: Bearer $GH_TOKEN" \
-                "https://api.github.com/repos/${{ github.repository }}/contents/endpoint.json" \
-                | python3 -c 'import json,sys; print(json.load(sys.stdin).get("sha",""))' 2>/dev/null || true)
+            "https://api.github.com/repos/${{ github.repository }}/contents/endpoint.json" \
+            | python3 -c 'import json,sys; print(json.load(sys.stdin).get("sha",""))' 2>/dev/null || true)
           BODY=$(python3 -c "
           import json,sys
           d={'message':'chore: publish colab endpoint','content':sys.argv[1],'branch':'main'}
@@ -124,18 +125,14 @@ jobs:
             "https://api.github.com/repos/${{ github.repository }}/contents/endpoint.json" \
             -o /dev/null -w "publish HTTP %{http_code}\n"
 
-          echo "url=$URL" >> "$GITHUB_OUTPUT"
-
       - name: Keep runtime alive
         if: success()
         run: |
-          echo "serving until job timeout; the app reconnects on its own"
           for i in $(seq 1 66); do
             sleep 300
-            colab exec -s revive -f colab-gpu-env/scripts/status.py 2>/dev/null \
-              | grep -E '^\{' | tail -1 | python3 -c "import json,sys; d=json.load(sys.stdin); print('heartbeat', d.get('gpu'), d.get('url','')[-20:])" || true
+            echo "heartbeat $i $(date -u +%H:%M)"
           done
 
       - name: Teardown
         if: always()
-        run: colab stop -s revive || true
+        run: colab stop || true
