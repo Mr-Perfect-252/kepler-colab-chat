@@ -1,12 +1,14 @@
 name: revive-colab
 
 # Triggered by the Android app (repository_dispatch: revive) or manually.
-# Boots a Colab T4, serves Mistral Small, publishes endpoint.json so the app can
-# reconnect, then babysits the runtime until the job limit.
 #
-# No `colab -s <alias>`: aliases resolve from the runner-local sessions.json and
-# an alias made by `colab new` was not resolvable by later steps. With a single
-# active session the CLI resolves it automatically.
+# Boots a Colab T4, serves Mistral Small, and publishes endpoint.json so the app
+# can reconnect on its own.
+#
+# Design note: the VM publishes the endpoint itself (serve.sh -> publish_endpoint.sh
+# with a token handed over at boot). CI only watches the resulting file. Polling the
+# VM via `colab exec` proved unreliable — `colab -s <alias>` did not resolve the
+# session created by `colab new`, so the old wait loop spun forever.
 on:
   repository_dispatch:
     types: [revive]
@@ -51,73 +53,71 @@ jobs:
           colab new --gpu T4
           colab sessions
 
-      - name: Upload bundle and start stack
+      - name: Boot stack on the VM
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
         run: |
           tar czf /tmp/cge.tgz colab-gpu-env
           colab upload /tmp/cge.tgz /content/cge.tgz
+          printf '%s' "$GH_TOKEN" > /tmp/tok
+          colab upload /tmp/tok /content/.ghtoken
           cat > /tmp/boot.py <<'PY'
+          import os
           import subprocess
+          tok = open("/content/.ghtoken").read().strip()
+          env = dict(os.environ)
+          env["GITHUB_TOKEN"] = tok
+          env["PUBLISH_REPO"] = os.environ.get("PUBLISH_REPO", "")
+          env["PUBLISH_PATH"] = "endpoint.json"
           subprocess.Popen(
               "cd /content && tar xzf cge.tgz && chmod +x colab-gpu-env/*.sh && "
-              "( bash colab-gpu-env/setup.sh && bash colab-gpu-env/serve.sh ) "
-              "> /content/boot.log 2>&1 < /dev/null &",
-              shell=True)
+              "bash colab-gpu-env/setup.sh > /content/setup.log 2>&1 && "
+              "bash colab-gpu-env/serve.sh > /content/serve.log 2>&1",
+              shell=True, env=env, start_new_session=True,
+              stdout=open("/content/boot.log", "w"),
+              stderr=subprocess.STDOUT)
           print("boot started")
           PY
-          colab exec -f /tmp/boot.py
+          cat > /tmp/run.py <<'PY'
+          import os
+          import re
+          path = "/tmp/boot.py"
+          src = open(path).read()
+          src = src.replace('os.environ.get("PUBLISH_REPO", "")',
+                            repr(os.environ.get("REPO", "")))
+          open("/tmp/boot2.py", "w").write(src)
+          print("prepared")
+          PY
+          python3 /tmp/run.py
+          colab exec -f /tmp/boot2.py
 
-      - name: Wait for tunnel
+      - name: Wait for the VM to publish the endpoint
         timeout-minutes: 30
-        run: |
-          for i in $(seq 1 90); do
-            colab exec -f colab-gpu-env/scripts/status.py > /tmp/raw.txt 2>&1 || true
-            grep -E '^\{' /tmp/raw.txt | tail -1 > /tmp/status.json || true
-            URL=$(python3 -c "import json;print(json.load(open('/tmp/status.json')).get('url',''))" 2>/dev/null || echo "")
-            echo "[$i] url=${URL:-none}"
-            if [ -n "$URL" ]; then echo "tunnel up: $URL"; exit 0; fi
-            sleep 20
-          done
-          echo "no tunnel after 30 min; last probe:"
-          cat /tmp/raw.txt
-          exit 1
-
-      - name: Publish endpoint
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
         run: |
-          cat > /tmp/publish.py <<'PY'
-          import json
-          import time
-          st = json.load(open("/tmp/status.json"))
-          assert st["url"], "no url in status"
-          doc = {
-              "base_url": st["url"],
-              "api_key": st["api_key"],
-              "model": "mistral-small-3.1-24b",
-              "updated_at": int(time.time()),
-              "session": "actions",
-          }
-          json.dump(doc, open("/tmp/endpoint.json", "w"), indent=2)
-          print("endpoint:", doc["base_url"], "| gpu:", st.get("gpu"))
-          PY
-          python3 /tmp/publish.py
-
-          CONTENT=$(base64 -w0 /tmp/endpoint.json)
-          SHA=$(curl -sS -H "Authorization: Bearer $GH_TOKEN" "https://api.github.com/repos/${{ github.repository }}/contents/endpoint.json" | python3 -c "import json,sys;print(json.load(sys.stdin).get('sha',''))" 2>/dev/null || true)
-          cat > /tmp/put.py <<'PY'
-          import json
-          import sys
-          doc = {"message": "chore: publish colab endpoint",
-                 "content": sys.argv[1], "branch": "main"}
-          if sys.argv[2]:
-              doc["sha"] = sys.argv[2]
-          print(json.dumps(doc))
-          PY
-          BODY=$(python3 /tmp/put.py "$CONTENT" "$SHA")
-          curl -sS -X PUT -H "Authorization: Bearer $GH_TOKEN" \
-            -H "Accept: application/vnd.github+json" -d "$BODY" \
-            "https://api.github.com/repos/${{ github.repository }}/contents/endpoint.json" \
-            -o /dev/null -w "publish HTTP %{http_code}\n"
+          START=$(date +%s)
+          for i in $(seq 1 85); do
+            curl -sS -H "Authorization: Bearer $GH_TOKEN" \
+              "https://api.github.com/repos/$REPO/contents/endpoint.json?ref=main" \
+              -o /tmp/ep.json || true
+            DONE=$(python3 -c "
+          import base64, json, sys
+          try:
+              d = json.load(open('/tmp/ep.json'))
+              doc = json.loads(base64.b64decode(d['content']))
+              print('yes' if int(doc.get('updated_at', 0)) >= int(sys.argv[1]) else 'no')
+          except Exception:
+              print('no')
+          " "$START")
+            echo "poll $i: published=$DONE"
+            if [ "$DONE" = "yes" ]; then echo "endpoint published"; exit 0; fi
+            sleep 20
+          done
+          echo "VM never published an endpoint" >&2
+          exit 1
 
       - name: Keep runtime alive
         if: success()
